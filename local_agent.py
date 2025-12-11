@@ -26,7 +26,7 @@ from pipecat.services.cartesia.tts import CartesiaTTSService
 from pipecat.services.openai.llm import OpenAILLMService
 
 from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
-from pipecat.frames.frames import TTSSpeakFrame, TTSAudioRawFrame
+from pipecat.frames.frames import TTSSpeakFrame, TTSAudioRawFrame, LLMMessagesFrame
 
 
 from dotenv import load_dotenv
@@ -70,9 +70,11 @@ from pipecat.processors.frame_processor import FrameProcessor, FrameDirection
 async def run_local_voice_agent():
 
     transport_params = LocalAudioTransportParams(
+        audio_in_enabled=True,
         audio_in_sample_rate=16000,
-        audio_out_sample_rate=16000,
         audio_in_channels=1,
+        audio_out_enabled=True,  # CRITICAL: Enable audio output
+        audio_out_sample_rate=22050,  # Match Cartesia's default output
         audio_out_channels=1,
     )
     transport = LocalAudioTransport(transport_params)
@@ -143,8 +145,22 @@ async def run_local_voice_agent():
         ),
     )
 
+    initial_messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are a helpful voice assistant. "
+                "Keep answers short and conversational."
+            ),
+        },
+        {
+            "role": "user",
+            "content": "Say hello and introduce yourself briefly.",
+        },
+    ]
+    
     await task.queue_frames([
-        TTSSpeakFrame("Hello, I am your local test assistant. Say something and I will reply.")
+        LLMMessagesFrame(initial_messages),
     ])
 
     runner = PipelineRunner()
