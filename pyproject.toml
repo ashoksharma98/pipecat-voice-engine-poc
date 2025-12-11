@@ -1,0 +1,17 @@
+[project]
+name = "asterisk-agents"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "cartesia>=2.0.17",
+    "fastapi>=0.124.1",
+    "openai>=2.9.0",
+    "pipecat-ai>=0.0.97",
+    "pyaudio>=0.2.14",
+    "python-dotenv>=1.2.1",
+    "sounddevice>=0.5.3",
+    "uvicorn>=0.38.0",
+    "websockets>=15.0.1",
+]
