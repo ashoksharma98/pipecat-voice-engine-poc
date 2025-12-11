@@ -20,7 +20,29 @@ logger.setLevel(logging.DEBUG)
 MSG_UUID = 0x01
 MSG_AUDIO = 0x10
 MSG_HANGUP = 0x00
-CHUNK_SIZE = 320  # 20ms at 16kHz = 320 bytes
+CHUNK_SIZE = 640  # 20ms at 16kHz = 320 bytes
+
+import numpy as np
+import samplerate   # pip install samplerate
+
+TARGET_RATE = 8000
+SOURCE_RATE = 16000   # ← adjust to your TTS output rate
+
+def convert_to_8k(raw_audio: bytes) -> bytes:
+    """Convert PCM16LE raw audio bytes to 8kHz PCM16LE bytes."""
+    # Convert byte stream → int16 numpy array
+    pcm16 = np.frombuffer(raw_audio, dtype=np.int16)
+
+    # Convert int16 → float32 in range [-1, 1]
+    pcm_float = pcm16.astype(np.float32) / 32768.0
+
+    # Resample to 8 kHz
+    resampled = samplerate.resample(pcm_float, TARGET_RATE / SOURCE_RATE, "sinc_best")
+
+    # Convert back to int16 PCM bytes
+    pcm16_out = (resampled * 32768.0).astype(np.int16)
+
+    return pcm16_out.tobytes()
 
 
 class AudioSocketInput(FrameProcessor):
@@ -119,31 +141,33 @@ class AudioSocketOutput(FrameProcessor):
         
         # Check if this is audio output from TTS
         if isinstance(frame, OutputAudioRawFrame) and self._is_open:
-            audio = frame.audio
-            
-            if audio and len(audio) > 0:
-                logger.debug(f"AudioSocketOutput: Sending {len(audio)} bytes to Asterisk")
-                
-                try:
-                    # Send audio in chunks
-                    for i in range(0, len(audio), CHUNK_SIZE):
-                        chunk = audio[i:i + CHUNK_SIZE]
+            audio = convert_to_8k(frame.audio)
+            header = struct.pack("B", MSG_AUDIO) + struct.pack(">H", len(audio))
+            self._writer.write(header + audio)
+            await self._writer.drain()
+            # if audio and len(audio) > 0:
+            #     logger.debug(f"AudioSocketOutput: Sending {len(audio)} bytes to Asterisk")
+              
+            #     try:
+            #         # Send audio in chunks
+            #         for i in range(0, len(audio), CHUNK_SIZE):
+            #             chunk = audio[i:i + CHUNK_SIZE]
                         
-                        # Pad last chunk if needed
-                        if len(chunk) < CHUNK_SIZE:
-                            chunk = chunk + (b"\x00" * (CHUNK_SIZE - len(chunk)))
+            #             # Pad last chunk if needed
+            #             if len(chunk) < CHUNK_SIZE:
+            #                 chunk = chunk + (b"\x00" * (CHUNK_SIZE - len(chunk)))
                         
-                        # Create AudioSocket packet: [type(1)] [length(2)] [data(n)]
-                        header = struct.pack("B", MSG_AUDIO) + struct.pack(">H", len(chunk))
+            #             # Create AudioSocket packet: [type(1)] [length(2)] [data(n)]
+            #             header = struct.pack("B", MSG_AUDIO) + struct.pack(">H", len(chunk))
                         
-                        self._writer.write(header + chunk)
-                        await self._writer.drain()
+            #             self._writer.write(header + chunk)
+            #             await self._writer.drain()
                     
-                    logger.debug("AudioSocketOutput: Audio sent successfully")
-                
-                except Exception as e:
-                    logger.error(f"AudioSocketOutput: Error writing to socket: {e}")
-                    self._is_open = False
+            #         logger.debug("AudioSocketOutput: Audio sent successfully")
+
+            #     except Exception as e:
+            #         logger.error(f"AudioSocketOutput: Error writing to socket: {e}")
+            #         self._is_open = False
         
         elif isinstance(frame, (EndFrame, CancelFrame)):
             logger.debug(f"AudioSocketOutput: Received {frame.__class__.__name__}")

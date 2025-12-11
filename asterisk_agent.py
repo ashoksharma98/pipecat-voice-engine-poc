@@ -12,7 +12,7 @@ from pipecat.services.openai import OpenAILLMService
 from pipecat.processors.aggregators.openai_llm_context import (
     OpenAILLMContext,
 )
-
+from pipecat.frames.frames import LLMMessagesFrame
 from audiosocket_transport import AudioSocketTransport
 
 from dotenv import load_dotenv
@@ -110,7 +110,24 @@ async def handle_call(reader: asyncio.StreamReader, writer: asyncio.StreamWriter
         # 6. Start the pipeline runner FIRST (this will send StartFrame)
         runner = PipelineRunner()
         logger.info("Starting pipeline runner...")
+        initial_messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are a helpful voice assistant. "
+                    "Keep answers short and conversational."
+                ),
+            },
+            {
+                "role": "user",
+                "content": "Say hello and introduce yourself briefly.",
+            },
+        ]
         
+        await task.queue_frames([
+            LLMMessagesFrame(initial_messages),
+        ])
+        await asyncio.sleep(7)
         # Run pipeline in background
         runner_task = asyncio.create_task(runner.run(task))
         
