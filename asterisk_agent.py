@@ -50,7 +50,7 @@ async def handle_call(reader: asyncio.StreamReader, writer: asyncio.StreamWriter
         # 1. Create transport (but don't start yet)
         # IMPORTANT: Asterisk slin16 format = 16kHz, 16-bit signed PCM, mono
         SAMPLE_RATE = 16000
-        transport = AudioSocketTransport(reader, writer, sample_rate=SAMPLE_RATE)
+        transport = AudioSocketTransport(reader=reader, writer=writer, sample_rate=SAMPLE_RATE)
         logger.info(f"Transport created (sample_rate={SAMPLE_RATE}Hz)")
 
         # 2. Create services - ALL must use same sample rate
