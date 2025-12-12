@@ -14,7 +14,8 @@ from pipecat.frames.frames import (
     EndFrame,
     CancelFrame,
 )
-
+from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.audio.vad.vad_analyzer import VADAnalyzer, VADParams
 logger = logging.getLogger("audiosocket_transport")
 logger.setLevel(logging.DEBUG)
 
@@ -24,10 +25,24 @@ MSG_AUDIO = 0x10
 MSG_HANGUP = 0x00
 CHUNK_SIZE = 320  # 20ms at 8kHz = 160 samples * 1 byte = 160 bytes for SLIN
 
+VAD_CONFIDENCE = 0.7
+VAD_START_SECS = 0.2
+VAD_STOP_SECS = 0.8
+VAD_MIN_VOLUME = 0.6
 
 class AudioSocketTransportParams(TransportParams):
-    def __init__(self):
-        super().__init__()
+    def __init__(
+        self,
+        vad_enabled: bool = True,
+        vad_analyzer: Optional[SileroVADAnalyzer] = None,
+    ):
+        super().__init__(
+            audio_in_enabled=True,
+            audio_out_enabled=True,
+            vad_enabled=vad_enabled,
+            vad_analyzer=vad_analyzer,
+        )
+
 
 
 class AudioSocketInput(FrameProcessor):
@@ -35,7 +50,7 @@ class AudioSocketInput(FrameProcessor):
 
     def __init__(
         self,
-        # params: AudioSocketTransportParams,
+        params: AudioSocketTransportParams,
         reader: asyncio.StreamReader,
         sample_rate: int = 16000,
     ):
@@ -46,7 +61,18 @@ class AudioSocketInput(FrameProcessor):
         self._running = False
         self._read_task: Optional[asyncio.Task] = None
         self._uuid_read = False
-        # self._params = params
+        self._params = params
+
+        if params.vad_enabled and params.vad_analyzer is None:
+            self._params.vad_analyzer = SileroVADAnalyzer(
+                sample_rate=sample_rate,
+
+            )
+            logger.info(
+                f"AudioSocketInput: Initialized Silero VAD (confidence={params.vad_confidence}, "
+                f"min_speech={params.min_speech_duration_ms}ms, "
+                f"min_silence={params.min_silence_duration_ms}ms)"
+            )
 
     async def process_frame(self, frame, direction):
         """Handle control frames"""
@@ -94,13 +120,24 @@ class AudioSocketInput(FrameProcessor):
 
                     if msg_type == MSG_AUDIO:
                         # Upsample from 8kHz to 16kHz for STT
-
                         # Push audio downstream to STT
                         frame = InputAudioRawFrame(
                             audio=payload, sample_rate=self._sample_rate, num_channels=1
                         )
-                        await self.push_frame(frame, FrameDirection.DOWNSTREAM)
-
+                        if self._params.vad_enabled and self._params.vad_analyzer:
+                            # VAD analyzer returns a list of frames (could include VAD events)
+                            vad_frames = await self._params.vad_analyzer.analyze_audio(
+                                frame
+                            )
+                            # Push all frames returned by VAD
+                            for vad_frame in vad_frames:
+                                await self.push_frame(
+                                    vad_frame, FrameDirection.DOWNSTREAM
+                                )
+                        else:
+                            # Push audio directly without VAD
+                            await self.push_frame(frame, FrameDirection.DOWNSTREAM)
+            
                     elif msg_type == MSG_HANGUP:
                         logger.info("AudioSocketInput: Received HANGUP from Asterisk")
                         self._running = False
@@ -127,7 +164,7 @@ class AudioSocketOutput(FrameProcessor):
 
     def __init__(
         self,
-        # params: AudioSocketTransportParams,
+        params: AudioSocketTransportParams,
         writer: asyncio.StreamWriter,
         input_sample_rate: int = 16000,
         debug: bool = False,
@@ -138,7 +175,7 @@ class AudioSocketOutput(FrameProcessor):
         self._input_sample_rate = input_sample_rate  # TTS output rate (16kHz)
         self._output_sample_rate = 8000  # Asterisk expects 8kHz
         self._debug = debug
-        # self._params = params
+        self._params = params
 
     def _downsample_audio(self, audio_bytes: bytes) -> bytes:
         """Downsample audio from 16kHz (TTS) to 8kHz (Asterisk)"""
@@ -261,7 +298,7 @@ class AudioSocketTransport(BaseTransport):
 
     def __init__(
         self,
-        # params: AudioSocketTransportParams,
+        params: AudioSocketTransportParams,
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
         sample_rate: int = 16000,  # Sample rate for STT/TTS (will convert to/from 8kHz)
@@ -270,15 +307,15 @@ class AudioSocketTransport(BaseTransport):
         self._reader = reader
         self._writer = writer
         self._sample_rate = sample_rate
-        # self._params = params
+        self._params = params
 
         self._input_processor = AudioSocketInput(
-            # params=self._params, 
+            params=self._params, 
             reader=reader, 
             sample_rate=sample_rate
         )
         self._output_processor = AudioSocketOutput(
-            # params=self._params, 
+            params=self._params, 
             writer=writer, 
             input_sample_rate=sample_rate
         )

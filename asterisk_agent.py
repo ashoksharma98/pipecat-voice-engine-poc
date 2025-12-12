@@ -7,17 +7,16 @@ from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineTask, PipelineParams
 
-from pipecat.services.cartesia import CartesiaSTTService, CartesiaTTSService
-from pipecat.services.openai import OpenAILLMService
+from pipecat.services.cartesia.stt import CartesiaSTTService
+from pipecat.services.cartesia.tts import CartesiaTTSService
+from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.processors.aggregators.openai_llm_context import (
     OpenAILLMContext,
 )
 from pipecat.frames.frames import LLMMessagesFrame
-from audiosocket_transport import AudioSocketTransport
-from pipecat.transports.websocket.server import (
-    WebsocketServerParams,
-    WebsocketServerTransport,
-)
+from audiosocket_transport import AudioSocketTransport, AudioSocketTransportParams
+
+from pipecat.audio.vad.silero import SileroVADAnalyzer
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -50,7 +49,7 @@ async def handle_call(reader: asyncio.StreamReader, writer: asyncio.StreamWriter
         # 1. Create transport (but don't start yet)
         # IMPORTANT: Asterisk slin16 format = 16kHz, 16-bit signed PCM, mono
         SAMPLE_RATE = 16000
-        transport = AudioSocketTransport(reader=reader, writer=writer, sample_rate=SAMPLE_RATE)
+        transport = AudioSocketTransport(reader=reader, writer=writer, sample_rate=SAMPLE_RATE, params=AudioSocketTransportParams(vad_analyzer=SileroVADAnalyzer()))
         logger.info(f"Transport created (sample_rate={SAMPLE_RATE}Hz)")
 
         # 2. Create services - ALL must use same sample rate
