@@ -121,22 +121,24 @@ class AudioSocketInput(FrameProcessor):
                     if msg_type == MSG_AUDIO:
                         # Upsample from 8kHz to 16kHz for STT
                         # Push audio downstream to STT
-                        frame = InputAudioRawFrame(
-                            audio=payload, sample_rate=self._sample_rate, num_channels=1
-                        )
+                       
                         if self._params.vad_enabled and self._params.vad_analyzer:
                             # VAD analyzer returns a list of frames (could include VAD events)
                             vad_frames = await self._params.vad_analyzer.analyze_audio(
-                                frame
+                                payload
                             )
                             # Push all frames returned by VAD
                             for vad_frame in vad_frames:
                                 await self.push_frame(
-                                    vad_frame, FrameDirection.DOWNSTREAM
+                                    InputAudioRawFrame(
+                            audio=vad_frame, sample_rate=self._sample_rate, num_channels=1
+                        ), FrameDirection.DOWNSTREAM
                                 )
                         else:
                             # Push audio directly without VAD
-                            await self.push_frame(frame, FrameDirection.DOWNSTREAM)
+                            await self.push_frame(InputAudioRawFrame(
+                            audio=payload, sample_rate=self._sample_rate, num_channels=1
+                        ), FrameDirection.DOWNSTREAM)
             
                     elif msg_type == MSG_HANGUP:
                         logger.info("AudioSocketInput: Received HANGUP from Asterisk")
