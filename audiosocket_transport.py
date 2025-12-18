@@ -12,6 +12,7 @@ import wave
 from typing import Optional
 from math import gcd
 import time
+import audioop
 
 import numpy as np
 from scipy.signal import resample_poly, butter, filtfilt, iirfilter, sosfiltfilt
@@ -166,6 +167,109 @@ class AudioSocketTransportParams(TransportParams):
 
 
 
+# class AudioSocketInput(FrameProcessor):
+#     """Input processor: reads AudioSocket TCP from Asterisk, decodes PCM and upsamples 8k -> pipeline_rate."""
+
+#     def __init__(self, params: AudioSocketTransportParams, reader: asyncio.StreamReader, asterisk_sample_rate: int = 8000, pipeline_sample_rate: int = 16000):
+#         super().__init__()
+#         self._reader = reader
+#         self._params = params
+#         self._asterisk_sample_rate = int(asterisk_sample_rate)
+#         self._pipeline_sample_rate = int(pipeline_sample_rate)
+#         self._running = False
+#         self._read_task: Optional[asyncio.Task] = None
+#         self._uuid_read = False
+#         self._resample_state = None
+
+#     def _upsample_8k_to_pipeline(self, audio_bytes: bytes) -> bytes:
+#         """
+#         Convert 8k int16 LE bytes -> pipeline_sample_rate int16 LE bytes using audioop (C-optimized).
+#         Avoiding scipy.resample_poly inside the loop prevents event loop blocking.
+#         """
+#         import audioop
+#         if self._asterisk_sample_rate == self._pipeline_sample_rate:
+#             return audio_bytes
+        
+#         # audioop.ratecv(fragment, width, nchannels, inrate, outrate, state, weightA, weightB)
+#         # width=2 (16-bit), nchannels=1
+#         new_fragment, self._resample_state = audioop.ratecv(
+#             audio_bytes, 
+#             2, 
+#             1, 
+#             self._asterisk_sample_rate, 
+#             self._pipeline_sample_rate, 
+#             self._resample_state
+#         )
+#         return new_fragment
+
+#     async def process_frame(self, frame, direction):
+#         await super().process_frame(frame, direction)
+
+#         if isinstance(frame, StartFrame):
+#             logger.debug("AudioSocketInput received StartFrame - starting audio read loop")
+#             self._running = True
+#             if self._read_task is None or self._read_task.done():
+#                 self._read_task = asyncio.create_task(self._read_loop())
+
+#         elif isinstance(frame, (EndFrame, CancelFrame)):
+#             logger.debug(f"AudioSocketInput received {frame.__class__.__name__} - stopping")
+#             self._running = False
+#             if self._read_task and not self._read_task.done():
+#                 self._read_task.cancel()
+
+#         await self.push_frame(frame, direction)
+
+#     def start_reading(self):
+#         if self._running and not self._read_task:
+#             self._uuid_read = True
+#             self._read_task = asyncio.create_task(self._read_loop())
+#             logger.info("AudioSocketInput: Read loop started")
+
+#     async def _read_loop(self):
+#         try:
+#             logger.info("AudioSocketInput: audio read loop entered (asterisk_sr=%d pipeline_sr=%d)", self._asterisk_sample_rate, self._pipeline_sample_rate)
+#             while self._running:
+#                 try:
+#                     header = await self._reader.readexactly(3)
+#                     msg_type = header[0]
+#                     length = struct.unpack(">H", header[1:])[0]
+#                     payload = await self._reader.readexactly(length)
+
+#                     if msg_type == MSG_AUDIO:
+#                         # Asterisk slin -> 8k pcm_s16le payload
+#                         # Convert to pipeline sample rate (upsample 8k->pipeline, e.g., 16k)
+#                         up_bytes = self._upsample_8k_to_pipeline(payload)
+
+#                         frame = InputAudioRawFrame(
+#                             audio=up_bytes,
+#                             sample_rate=self._pipeline_sample_rate,
+#                             num_channels=1
+#                         )
+#                         # logger.warning(f"INPUT AUDIO FRAME → {len(up_bytes)} bytes")
+#                         await self.push_frame(frame, FrameDirection.DOWNSTREAM)
+
+#                     elif msg_type == MSG_HANGUP:
+#                         logger.info("AudioSocketInput: Received HANGUP")
+#                         self._running = False
+#                         await self.push_frame(EndFrame(), FrameDirection.DOWNSTREAM)
+#                         break
+#                     else:
+#                         logger.debug("AudioSocketInput: Unknown msg_type 0x%02x length=%d", msg_type, length)
+
+#                 except asyncio.IncompleteReadError:
+#                     logger.warning("AudioSocketInput: connection closed by peer")
+#                     self._running = False
+#                     await self.push_frame(EndFrame(), FrameDirection.DOWNSTREAM)
+#                     break
+
+#         except asyncio.CancelledError:
+#             logger.debug("AudioSocketInput: read loop cancelled")
+#         except Exception as e:
+#             logger.exception("AudioSocketInput: unexpected error: %s", e)
+#             self._running = False
+#             await self.push_frame(EndFrame(), FrameDirection.DOWNSTREAM)
+
+
 class AudioSocketInput(FrameProcessor):
     """Input processor: reads AudioSocket TCP from Asterisk, decodes PCM and upsamples 8k -> pipeline_rate."""
 
@@ -177,29 +281,22 @@ class AudioSocketInput(FrameProcessor):
         self._pipeline_sample_rate = int(pipeline_sample_rate)
         self._running = False
         self._read_task: Optional[asyncio.Task] = None
-        self._uuid_read = False
+        self._resample_state = None
 
     def _upsample_8k_to_pipeline(self, audio_bytes: bytes) -> bytes:
-        """Convert 8k int16 LE bytes -> pipeline_sample_rate int16 LE bytes using polyphase upsample."""
         if self._asterisk_sample_rate == self._pipeline_sample_rate:
             return audio_bytes
-
-        arr = _ensure_int16_le(audio_bytes)
-        if arr.size == 0:
-            return b""
-
-        # Convert to float for resampling
-        float_arr = _float_from_int16_le(arr)
-
-        up = self._pipeline_sample_rate
-        down = self._asterisk_sample_rate
-        g = gcd(up, down)
-        up //= g
-        down //= g
-
-        res = resample_poly(float_arr, up, down)
-        res_int16 = _int16_le_from_float(res)
-        return res_int16.tobytes()
+        
+        # Use audioop for efficient C-based resampling
+        new_fragment, self._resample_state = audioop.ratecv(
+            audio_bytes, 
+            2, 
+            1, 
+            self._asterisk_sample_rate, 
+            self._pipeline_sample_rate, 
+            self._resample_state
+        )
+        return new_fragment
 
     async def process_frame(self, frame, direction):
         await super().process_frame(frame, direction)
@@ -207,7 +304,7 @@ class AudioSocketInput(FrameProcessor):
         if isinstance(frame, StartFrame):
             logger.debug("AudioSocketInput received StartFrame - starting audio read loop")
             self._running = True
-            if self._uuid_read and (self._read_task is None or self._read_task.done()):
+            if self._read_task is None or self._read_task.done():
                 self._read_task = asyncio.create_task(self._read_loop())
 
         elif isinstance(frame, (EndFrame, CancelFrame)):
@@ -218,40 +315,46 @@ class AudioSocketInput(FrameProcessor):
 
         await self.push_frame(frame, direction)
 
-    def start_reading(self):
-        if self._running and not self._read_task:
-            self._uuid_read = True
-            self._read_task = asyncio.create_task(self._read_loop())
-            logger.info("AudioSocketInput: Read loop started")
-
     async def _read_loop(self):
+        # Standard Asterisk AudioSocket Message Types
+        MSG_UUID = 0x01
+        MSG_AUDIO = 0x10
+        MSG_HANGUP = 0x00
+        
         try:
-            logger.info("AudioSocketInput: audio read loop entered (asterisk_sr=%d pipeline_sr=%d)", self._asterisk_sample_rate, self._pipeline_sample_rate)
+            logger.info("AudioSocketInput: audio read loop entered")
             while self._running:
                 try:
+                    # 1. READ HEADER
                     header = await self._reader.readexactly(3)
                     msg_type = header[0]
                     length = struct.unpack(">H", header[1:])[0]
+
+                    # 2. READ PAYLOAD
                     payload = await self._reader.readexactly(length)
 
+                    # 3. HANDLE MESSAGE TYPES
                     if msg_type == MSG_AUDIO:
-                        # Asterisk slin -> 8k pcm_s16le payload
-                        # Convert to pipeline sample rate (upsample 8k->pipeline, e.g., 16k)
+                        logger.info(f"AudioSocketInput: Audio Message Received...")
                         up_bytes = self._upsample_8k_to_pipeline(payload)
-
                         frame = InputAudioRawFrame(
                             audio=up_bytes,
                             sample_rate=self._pipeline_sample_rate,
                             num_channels=1
                         )
-                        logger.warning(f"INPUT AUDIO FRAME → {len(upsampled_bytes)} bytes")
                         await self.push_frame(frame, FrameDirection.DOWNSTREAM)
+
+                    elif msg_type == MSG_UUID:
+                        # We handle the UUID here inside the loop instead of transport.start()
+                        uuid_str = payload.decode(errors='ignore')
+                        logger.info(f"AudioSocketInput: Call Connected. UUID: {uuid_str}")
 
                     elif msg_type == MSG_HANGUP:
                         logger.info("AudioSocketInput: Received HANGUP")
                         self._running = False
                         await self.push_frame(EndFrame(), FrameDirection.DOWNSTREAM)
                         break
+                    
                     else:
                         logger.debug("AudioSocketInput: Unknown msg_type 0x%02x length=%d", msg_type, length)
 
@@ -431,7 +534,7 @@ class AudioSocketOutput(FrameProcessor):
         await self.push_frame(frame, direction)
 
 
-class AudioSocketTransport(BaseTransport):
+class AudioSocketTransport1(BaseTransport):
     """
     Production-grade AudioSocketTransport for Asterisk external_media.
     Signature:
@@ -483,6 +586,58 @@ class AudioSocketTransport(BaseTransport):
                 await self._input_processor._read_task
             except asyncio.CancelledError:
                 pass
+        try:
+            if not self._writer.is_closing():
+                self._writer.close()
+                await self._writer.wait_closed()
+        except Exception:
+            logger.exception("AudioSocketTransport: error closing writer")
+
+
+class AudioSocketTransport(BaseTransport):
+    """
+    Production-grade AudioSocketTransport for Asterisk external_media.
+    """
+
+    def __init__(self, params: AudioSocketTransportParams, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, sample_rate: int = 16000):
+        super().__init__()
+        self._params = params
+        self._reader = reader
+        self._writer = writer
+        self._pipeline_sample_rate = int(sample_rate)
+        self._asterisk_sample_rate = 8000
+
+        self._input_processor = AudioSocketInput(self._params, self._reader, asterisk_sample_rate=self._asterisk_sample_rate, pipeline_sample_rate=self._pipeline_sample_rate)
+        self._output_processor = AudioSocketOutput(self._params, self._writer, asterisk_sample_rate=self._asterisk_sample_rate, pipeline_sample_rate=self._pipeline_sample_rate)
+
+    def input(self) -> FrameProcessor:
+        return self._input_processor
+
+    def output(self) -> FrameProcessor:
+        return self._output_processor
+
+    async def start(self):
+        """
+        Signals the transport that the call is active. 
+        NOTE: We do NOT read from the socket here because the Input processor 
+        already started reading when the Pipeline sent the StartFrame.
+        """
+        logger.info("AudioSocketTransport: Transport active. Waiting for Input Processor to handle stream.")
+        # If the pipeline hasn't started yet (edge case), we could trigger it here,
+        # but in your script, runner.run() handles it.
+        pass
+
+    async def stop(self):
+        logger.debug("AudioSocketTransport: stopping")
+        # Cancel the input read task
+        if getattr(self._input_processor, "_read_task", None) and not self._input_processor._read_task.done():
+            self._input_processor._read_task.cancel()
+            try:
+                await self._input_processor._read_task
+            except asyncio.CancelledError:
+                pass
+        
+        # Close the writer
         try:
             if not self._writer.is_closing():
                 self._writer.close()
