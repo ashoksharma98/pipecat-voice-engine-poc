@@ -1,21 +1,28 @@
 import asyncio
 import struct
 import logging
+import audioop
 import numpy as np
 from scipy import signal
 from typing import Optional
 
 from pipecat.processors.frame_processor import FrameProcessor, FrameDirection
 from pipecat.transports.base_transport import BaseTransport, TransportParams
+from pipecat.transports.base_input import BaseInputTransport
+from pipecat.transports.base_output import BaseOutputTransport
 from pipecat.frames.frames import (
     InputAudioRawFrame,
     OutputAudioRawFrame,
     StartFrame,
     EndFrame,
     CancelFrame,
+    UserSpeakingFrame,
+    UserStartedSpeakingFrame,
+    UserStoppedSpeakingFrame,
 )
 from pipecat.audio.vad.silero import SileroVADAnalyzer
-from pipecat.audio.vad.vad_analyzer import VADAnalyzer, VADParams
+from pipecat.audio.vad.vad_analyzer import VADState
+
 logger = logging.getLogger("audiosocket_transport")
 logger.setLevel(logging.DEBUG)
 
@@ -24,6 +31,7 @@ MSG_UUID = 0x01
 MSG_AUDIO = 0x10
 MSG_HANGUP = 0x00
 CHUNK_SIZE = 320  # 20ms at 8kHz = 160 samples * 1 byte = 160 bytes for SLIN
+AUDIO_INPUT_TIMEOUT_SECS = 0.5
 
 VAD_CONFIDENCE = 0.7
 VAD_START_SECS = 0.2
@@ -45,111 +53,121 @@ class AudioSocketTransportParams(TransportParams):
 
 
 
-class AudioSocketInput(FrameProcessor):
-    """Handles incoming audio from Asterisk via AudioSocket protocol"""
+class AudioSocketInput(BaseInputTransport):
+    """
+    Handles incoming audio from Asterisk via AudioSocket protocol.
+    Inherits from BaseInputTransport to handle Start/Stop lifecycle automatically.
+    """
 
     def __init__(
         self,
-        params: AudioSocketTransportParams,
+        params: TransportParams,
         reader: asyncio.StreamReader,
-        sample_rate: int = 16000,
+        asterisk_sample_rate: int = 8000,
+        pipeline_sample_rate: int = 16000,
     ):
-        super().__init__()
+        # BaseInputTransport expects params
+        super().__init__(params)
+        
         self._reader = reader
-        self._sample_rate = sample_rate  # Output sample rate for STT (16kHz)
-        self._asterisk_sample_rate = 8000  # Asterisk sends 8kHz
-        self._running = False
+        self._asterisk_sample_rate = asterisk_sample_rate
+        self._pipeline_sample_rate = pipeline_sample_rate
+        
         self._read_task: Optional[asyncio.Task] = None
-        self._uuid_read = False
-        self._params = params
+        self._uuid_read = False  # Gate: Wait for UUID before reading audio
+        self._resample_state = None  # State for audioop resampling
 
-        if params.vad_enabled and params.vad_analyzer is None:
-            self._params.vad_analyzer = SileroVADAnalyzer(
-                sample_rate=sample_rate,
+    async def start(self, frame: StartFrame):
+        """
+        Called automatically by BaseInputTransport when StartFrame is received.
+        """
+        await super().start(frame)
+        logger.debug("AudioSocketInput: Received StartFrame (Pipeline Started)")
+        self._running = True
+        
+        # Only start the loop if we have already shaken hands (UUID read)
+        # Otherwise, start_reading() will trigger this later.
+        if self._uuid_read:
+            self._start_read_loop()
+        # await self.set_transport_ready(frame)
 
-            )
-            logger.info(
-                f"AudioSocketInput: Initialized Silero VAD (confidence={params.vad_confidence}, "
-                f"min_speech={params.min_speech_duration_ms}ms, "
-                f"min_silence={params.min_silence_duration_ms}ms)"
-            )
-
-    async def process_frame(self, frame, direction):
-        """Handle control frames"""
-        await super().process_frame(frame, direction)
-
-        if isinstance(frame, StartFrame):
-            logger.debug(
-                "AudioSocketInput received StartFrame - starting audio read loop"
-            )
-            self._running = True
-            if self._uuid_read:
-                self._read_task = asyncio.create_task(self._read_loop())
-
-        elif isinstance(frame, (EndFrame, CancelFrame)):
-            logger.debug(
-                f"AudioSocketInput received {frame.__class__.__name__} - stopping"
-            )
-            self._running = False
-            if self._read_task and not self._read_task.done():
-                self._read_task.cancel()
-
-        await self.push_frame(frame, direction)
+    async def stop(self, frame: EndFrame):
+        """
+        Called automatically by BaseInputTransport when EndFrame/CancelFrame is received.
+        """
+        await super().stop(frame)
+        logger.debug(f"AudioSocketInput: Received {frame.__class__.__name__} - Stopping")
+        self._running = False
+        if self._read_task and not self._read_task.done():
+            self._read_task.cancel()
+            try:
+                await self._read_task
+            except asyncio.CancelledError:
+                pass
 
     def start_reading(self):
-        """Called by transport after UUID is read to start the audio loop"""
-        if self._running and not self._read_task:
-            self._uuid_read = True
+        """
+        Public method called by the parent Transport after the UUID header is successfully read.
+        """
+        logger.info("AudioSocketInput: UUID verification complete. Enabling audio read.")
+        self._uuid_read = True
+        
+        # If the pipeline is already running (StartFrame received), kick off the loop now.
+        if self._running and (self._read_task is None or self._read_task.done()):
+            self._start_read_loop()
+
+    def _start_read_loop(self):
+        """Helper to safely start the task"""
+        if self._read_task is None or self._read_task.done():
             self._read_task = asyncio.create_task(self._read_loop())
-            logger.info("AudioSocketInput: Read loop task started")
+            logger.info("AudioSocketInput: Audio read loop task started")
 
     async def _read_loop(self):
         """Read audio packets from Asterisk"""
         try:
-            logger.info("AudioSocketInput: Audio read loop started")
-
+            logger.info(f"AudioSocketInput: Audio read loop active (Upsampling {self._asterisk_sample_rate} -> {self._pipeline_sample_rate})")
+            vad_analyzer = self._params.vad_analyzer
             while self._running:
                 try:
-                    # Read 3-byte header
+                    # 1. Read 3-byte header
                     header = await self._reader.readexactly(3)
                     msg_type = header[0]
                     length = struct.unpack(">H", header[1:])[0]
 
-                    # Read payload
+                    # 2. Read payload
                     payload = await self._reader.readexactly(length)
 
                     if msg_type == MSG_AUDIO:
-                        # Upsample from 8kHz to 16kHz for STT
-                        # Push audio downstream to STT
-                       
-                        if self._params.vad_enabled and self._params.vad_analyzer:
-                            # VAD analyzer returns a list of frames (could include VAD events)
-                            vad_frames = await self._params.vad_analyzer.analyze_audio(
-                                payload
-                            )
-                            # Push all frames returned by VAD
-                            for vad_frame in vad_frames:
-                                await self.push_frame(
-                                    InputAudioRawFrame(
-                            audio=vad_frame, sample_rate=self._sample_rate, num_channels=1
-                        ), FrameDirection.DOWNSTREAM
-                                )
-                        else:
-                            # Push audio directly without VAD
-                            await self.push_frame(InputAudioRawFrame(
-                            audio=payload, sample_rate=self._sample_rate, num_channels=1
-                        ), FrameDirection.DOWNSTREAM)
-            
+                        if vad_analyzer:
+                            vad_state = await vad_analyzer.analyze_audio(payload)
+
+                            if vad_state == VADState.STARTING:
+                                logger.debug("VAD: Speech Starting")
+                                await self.push_frame(UserStartedSpeakingFrame())
+                            
+                            elif vad_state == VADState.STOPPING:
+                                logger.debug("VAD: Speech Stopped")
+                                await self.push_frame(UserStoppedSpeakingFrame())
+
+                        frame = InputAudioRawFrame(
+                            audio=payload, 
+                            sample_rate=self._pipeline_sample_rate, 
+                            num_channels=1
+                        )
+                        
+                        await self.push_frame(frame)
+
                     elif msg_type == MSG_HANGUP:
                         logger.info("AudioSocketInput: Received HANGUP from Asterisk")
                         self._running = False
-                        await self.push_frame(EndFrame(), FrameDirection.DOWNSTREAM)
+                        # Push EndFrame to signal pipeline shutdown
+                        await self.push_frame(EndFrame())
                         break
 
                 except asyncio.IncompleteReadError:
                     logger.warning("AudioSocketInput: Connection closed by peer")
                     self._running = False
-                    await self.push_frame(EndFrame(), FrameDirection.DOWNSTREAM)
+                    await self.push_frame(EndFrame())
                     break
 
         except asyncio.CancelledError:
@@ -158,130 +176,128 @@ class AudioSocketInput(FrameProcessor):
         except Exception as e:
             logger.error(f"AudioSocketInput: Error in read loop: {e}", exc_info=True)
             self._running = False
-            await self.push_frame(EndFrame(), FrameDirection.DOWNSTREAM)
+            await self.push_frame(EndFrame())
 
 
-class AudioSocketOutput(FrameProcessor):
+class AudioSocketOutput(BaseOutputTransport):
     """Handles outgoing audio to Asterisk via AudioSocket protocol"""
 
     def __init__(
         self,
-        params: AudioSocketTransportParams,
+        params: TransportParams,
         writer: asyncio.StreamWriter,
         input_sample_rate: int = 16000,
+        output_sample_rate: int = 8000,
         debug: bool = False,
     ):
-        super().__init__()
+        super().__init__(params)
         self._writer = writer
-        self._is_open = True
-        self._input_sample_rate = input_sample_rate  # TTS output rate (16kHz)
-        self._output_sample_rate = 8000  # Asterisk expects 8kHz
+        self._input_sample_rate = input_sample_rate   # TTS output rate (16kHz)
+        self._output_sample_rate = output_sample_rate # Asterisk expects 8kHz
         self._debug = debug
-        self._params = params
+        
+        self._is_open = False
+        self._resample_state = None  # State for audioop resampling
+
+    async def start(self, frame: StartFrame):
+        """Called automatically when the pipeline starts"""
+        await super().start(frame)
+        logger.debug("AudioSocketOutput: Starting")
+        self._is_open = True
+
+    async def stop(self, frame: EndFrame):
+        """Called automatically when the pipeline stops"""
+        await super().stop(frame)
+        logger.debug("AudioSocketOutput: Stopping")
+        if self._is_open:
+            await self._send_hangup()
+        self._is_open = False
 
     def _downsample_audio(self, audio_bytes: bytes) -> bytes:
-        """Downsample audio from 16kHz (TTS) to 8kHz (Asterisk)"""
+        """
+        Downsample audio from 16kHz (TTS) to 8kHz (Asterisk) using audioop.
+        Replaces scipy/numpy to prevent event loop blocking.
+        """
         if self._input_sample_rate == self._output_sample_rate:
             return audio_bytes
 
-        # Convert bytes to numpy array (16-bit signed PCM)
-        audio_data = np.frombuffer(audio_bytes, dtype=np.int16)
-
-        # Calculate target number of samples
-        num_samples = int(
-            len(audio_data) * self._output_sample_rate / self._input_sample_rate
+        # audioop.ratecv(fragment, width, nchannels, inrate, outrate, state)
+        # width=2 (16-bit), nchannels=1
+        new_fragment, self._resample_state = audioop.ratecv(
+            audio_bytes,
+            2,
+            1,
+            self._input_sample_rate,
+            self._output_sample_rate,
+            self._resample_state
         )
+        return new_fragment
 
-        # Resample using scipy
-        resampled = signal.resample(audio_data, num_samples)
-
-        # Convert back to int16 and then to bytes
-        resampled_int16 = np.clip(resampled, -32768, 32767).astype(np.int16)
-        return resampled_int16.tobytes()
-
-    async def _send_audio_chunks(self, audio_data: bytes) -> bool:
-        """Send audio data in 320-byte chunks via AudioSocket protocol
-
-        Args:
-            audio_data: Audio data to send (should be 8kHz already)
-
-        Returns:
-            bool: True if completed successfully, False if error occurred
-        """
+    async def _send_audio_chunks(self, audio_data: bytes):
+        """Send audio data in 320-byte chunks via AudioSocket protocol with pacing"""
         total_chunks = (len(audio_data) + CHUNK_SIZE - 1) // CHUNK_SIZE
-
-        logger.info(
-            f"📤 [SEND] Sending {len(audio_data)} bytes in {total_chunks} chunks"
-        )
-
         chunks_sent = 0
 
         try:
             for i in range(0, len(audio_data), CHUNK_SIZE):
+                if not self._is_open:
+                    break
+
                 chunk = audio_data[i : i + CHUNK_SIZE]
 
-                # Pad last chunk if needed
+                # Pad last chunk if needed to maintain frame size
                 if len(chunk) < CHUNK_SIZE:
                     chunk = chunk + (b"\x00" * (CHUNK_SIZE - len(chunk)))
 
                 # Create AudioSocket packet: [type(1)] [length(2)] [data(n)]
+                # >H = Big Endian Unsigned Short (Standard for AudioSocket)
                 header = struct.pack("B", MSG_AUDIO) + struct.pack(">H", len(chunk))
 
                 self._writer.write(header + chunk)
                 await self._writer.drain()
 
-                # Sleep for 20ms (chunk duration at 8kHz) to pace the audio
+                # Critical: Sleep for 20ms to pace the audio delivery to Asterisk
+                # (320 bytes @ 8kHz 16-bit = 20ms audio)
                 await asyncio.sleep(0.02)
 
                 chunks_sent += 1
 
-                # Debug logging every 10th chunk
                 if self._debug and chunks_sent % 10 == 0:
                     logger.debug(f"📡 Sent chunk {chunks_sent}/{total_chunks}")
 
-            logger.info(
-                f"✅ [SEND] Audio transmission complete ({total_chunks} chunks)"
-            )
-            return True
-
         except Exception as e:
-            logger.error(f"❌ Error sending audio chunk {chunks_sent + 1}: {e}")
-            return False
+            logger.error(f"❌ AudioSocketOutput: Error sending chunk: {e}")
+            self._is_open = False
+
+    async def _send_hangup(self):
+        """Sends the AudioSocket HANGUP signal"""
+        try:
+            hangup_msg = struct.pack("B", MSG_HANGUP) + struct.pack(">H", 0)
+            self._writer.write(hangup_msg)
+            await self._writer.drain()
+            logger.debug("AudioSocketOutput: Sent HANGUP to Asterisk")
+        except Exception as e:
+            logger.warning(f"AudioSocketOutput: Could not send hangup: {e}")
 
     async def process_frame(self, frame, direction):
         """Process frames and send audio to Asterisk"""
         await super().process_frame(frame, direction)
 
-        if isinstance(frame, OutputAudioRawFrame) and self._is_open:
-            audio = frame.audio
-
-            if audio and len(audio) > 0:
-                logger.debug(f"AudioSocketOutput: Received {len(audio)} bytes from TTS")
-
+        if isinstance(frame, OutputAudioRawFrame):
+            if self._is_open and frame.audio and len(frame.audio) > 0:
                 try:
-                    # Downsample from 16kHz to 8kHz for Asterisk
-                    downsampled_audio = self._downsample_audio(audio)
+                    # 1. Downsample (Fast C-implementation)
+                    downsampled_audio = self._downsample_audio(frame.audio)
 
-                    # Send audio in chunks
+                    # 2. Send in paced chunks
                     await self._send_audio_chunks(downsampled_audio)
-
+                
                 except Exception as e:
-                    logger.error(f"AudioSocketOutput: Error processing audio: {e}")
-                    self._is_open = False
-
-        elif isinstance(frame, EndFrame):
-            logger.debug("AudioSocketOutput: Received EndFrame")
-            if self._is_open:
-                try:
-                    # Send hangup message
-                    hangup_msg = struct.pack("B", MSG_HANGUP) + struct.pack(">H", 0)
-                    self._writer.write(hangup_msg)
-                    await self._writer.drain()
-                    logger.debug("AudioSocketOutput: Sent HANGUP to Asterisk")
-                except Exception as e:
-                    logger.debug(f"AudioSocketOutput: Could not send hangup: {e}")
-
-                self._is_open = False
+                    logger.error(f"AudioSocketOutput: Error processing audio frame: {e}")
+        
+        elif isinstance(frame, (EndFrame, CancelFrame)):
+            # Stop lifecycle is handled by self.stop(), but we ensure cleanup here too
+            await self.stop(frame)
 
         await self.push_frame(frame, direction)
 
@@ -300,10 +316,10 @@ class AudioSocketTransport(BaseTransport):
 
     def __init__(
         self,
-        params: AudioSocketTransportParams,
+        params: TransportParams,
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
-        sample_rate: int = 16000,  # Sample rate for STT/TTS (will convert to/from 8kHz)
+        sample_rate: int = 16000,
     ):
         super().__init__()
         self._reader = reader
@@ -312,9 +328,9 @@ class AudioSocketTransport(BaseTransport):
         self._params = params
 
         self._input_processor = AudioSocketInput(
-            params=self._params, 
+            params=self._params,
             reader=reader, 
-            sample_rate=sample_rate
+            pipeline_sample_rate=sample_rate
         )
         self._output_processor = AudioSocketOutput(
             params=self._params, 
