@@ -16,7 +16,11 @@ from pipecat.frames.frames import (
     StartFrame,
     EndFrame,
     CancelFrame,
+    UserSpeakingFrame,
+    UserStartedSpeakingFrame,
+    UserStoppedSpeakingFrame,
 )
+from pipecat.audio.vad.vad_analyzer import VADState
 
 logger = logging.getLogger("audiosocket_transport")
 logger.setLevel(logging.DEBUG)
@@ -26,6 +30,7 @@ MSG_UUID = 0x01
 MSG_AUDIO = 0x10
 MSG_HANGUP = 0x00
 CHUNK_SIZE = 320  # 20ms at 8kHz = 160 samples * 1 byte = 160 bytes for SLIN
+AUDIO_INPUT_TIMEOUT_SECS = 0.5
 
 
 class AudioSocketTransportParams(TransportParams):
@@ -69,6 +74,7 @@ class AudioSocketInput(BaseInputTransport):
         # Otherwise, start_reading() will trigger this later.
         if self._uuid_read:
             self._start_read_loop()
+        # await self.set_transport_ready(frame)
 
     async def stop(self, frame: EndFrame):
         """
@@ -105,7 +111,7 @@ class AudioSocketInput(BaseInputTransport):
         """Read audio packets from Asterisk"""
         try:
             logger.info(f"AudioSocketInput: Audio read loop active (Upsampling {self._asterisk_sample_rate} -> {self._pipeline_sample_rate})")
-
+            vad_analyzer = self._params.vad_analyzer
             while self._running:
                 try:
                     # 1. Read 3-byte header
@@ -117,12 +123,23 @@ class AudioSocketInput(BaseInputTransport):
                     payload = await self._reader.readexactly(length)
 
                     if msg_type == MSG_AUDIO:
-                        # 4. Push audio downstream
+                        if vad_analyzer:
+                            vad_state = await vad_analyzer.analyze_audio(payload)
+
+                            if vad_state == VADState.STARTING:
+                                logger.debug("VAD: Speech Starting")
+                                await self.push_frame(UserStartedSpeakingFrame())
+                            
+                            elif vad_state == VADState.STOPPING:
+                                logger.debug("VAD: Speech Stopped")
+                                await self.push_frame(UserStoppedSpeakingFrame())
+
                         frame = InputAudioRawFrame(
                             audio=payload, 
                             sample_rate=self._pipeline_sample_rate, 
                             num_channels=1
                         )
+                        
                         await self.push_frame(frame)
 
                     elif msg_type == MSG_HANGUP:
