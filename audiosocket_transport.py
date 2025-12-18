@@ -115,17 +115,6 @@ class AudioSocketInput(BaseInputTransport):
                     payload = await self._reader.readexactly(length)
 
                     if msg_type == MSG_AUDIO:
-                        # 3. Upsample using audioop (Required for 8k -> 16k)
-                        if self._asterisk_sample_rate != self._pipeline_sample_rate:
-                            payload, self._resample_state = audioop.ratecv(
-                                payload, 
-                                2, # width (16-bit)
-                                1, # channels
-                                self._asterisk_sample_rate, 
-                                self._pipeline_sample_rate, 
-                                self._resample_state
-                            )
-
                         # 4. Push audio downstream
                         frame = InputAudioRawFrame(
                             audio=payload, 
