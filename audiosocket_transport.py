@@ -61,6 +61,7 @@ class AudioSocketInput(BaseInputTransport):
         """
         Called automatically by BaseInputTransport when StartFrame is received.
         """
+        await super().start(frame)
         logger.debug("AudioSocketInput: Received StartFrame (Pipeline Started)")
         self._running = True
         
@@ -73,6 +74,7 @@ class AudioSocketInput(BaseInputTransport):
         """
         Called automatically by BaseInputTransport when EndFrame/CancelFrame is received.
         """
+        await super().stop(frame)
         logger.debug(f"AudioSocketInput: Received {frame.__class__.__name__} - Stopping")
         self._running = False
         if self._read_task and not self._read_task.done():
@@ -167,11 +169,13 @@ class AudioSocketOutput(BaseOutputTransport):
 
     async def start(self, frame: StartFrame):
         """Called automatically when the pipeline starts"""
+        await super().start(frame)
         logger.debug("AudioSocketOutput: Starting")
         self._is_open = True
 
     async def stop(self, frame: EndFrame):
         """Called automatically when the pipeline stops"""
+        await super().stop(frame)
         logger.debug("AudioSocketOutput: Stopping")
         if self._is_open:
             await self._send_hangup()
