@@ -48,18 +48,21 @@ async def handle_call(reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     transport = None
     runner = None
 
+    SAMPLE_RATE = 8000
+
     try:
         params = TransportParams(
             audio_in_enabled=True,
             audio_out_enabled=True,
             vad_analyzer=SileroVADAnalyzer(
-                sample_rate=8000,
+                sample_rate=SAMPLE_RATE,
                 params=VADParams(
-                    confidence=0.7, start_secs=0.4, stop_secs=0.8, min_volume=0.6
+                    stop_secs=0.4,
+                    start_secs=0.2,
+                    confidence=0.6
                 ),
             ),
         )
-        SAMPLE_RATE = 16000
         transport = AudioSocketTransport(
             params=params, reader=reader, writer=writer, sample_rate=SAMPLE_RATE
         )
@@ -124,6 +127,14 @@ async def handle_call(reader: asyncio.StreamReader, writer: asyncio.StreamWriter
 
         logger.info("Starting pipeline runner...")
 
+        runner_task = asyncio.create_task(runner.run(task))
+
+        logger.info("Pipeline runner started")
+
+        logger.info("Starting transport...")
+        await transport.start()
+        logger.info("Transport started - call is now active")
+
         initial_messages = [
             {
                 "role": "system",
@@ -141,17 +152,6 @@ async def handle_call(reader: asyncio.StreamReader, writer: asyncio.StreamWriter
         await task.queue_frames([
             LLMMessagesFrame(initial_messages),
         ])
-
-        await asyncio.sleep(7)
-
-        runner_task = asyncio.create_task(runner.run(task))
-
-        await asyncio.sleep(0.2)
-        logger.info("Pipeline runner started")
-
-        logger.info("Starting transport...")
-        await transport.start()
-        logger.info("Transport started - call is now active")
 
         logger.info("Waiting for call to complete...")
         await runner_task
